@@ -17,6 +17,7 @@ import (
 	"github.com/filecoin-project/go-state-types/big"
 
 	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -602,6 +603,7 @@ var sectorsUpdateCmd = &cli.Command{
 		return nodeApi.SectorsUpdate(ctx, abi.SectorNumber(id), api.SectorState(cctx.Args().Get(1)))
 	},
 }
+
 var sectorsExtendCmd = &cli.Command{
 	Name:      "extend",
 	Usage:     "Extend sector expiration",
@@ -613,55 +615,115 @@ var sectorsExtendCmd = &cli.Command{
 			Required: false,
 		},
 		&cli.BoolFlag{
-			Name:     "allsectors",
-			Usage:    "renews all sectors up to the maximum possible lifetime",
+			Name:     "all-sectors",
+			Usage:    "renews all sectors expiration to <new-expiration> if possible",
+			Required: false,
+		},
+		&cli.Int64Flag{
+			Name:     "tolerance",
+			Value:    20160,
+			Usage:    "when extending all sectors, don't try to extend sectors by fewer than this number of epochs",
+			Required: false,
+		},
+		&cli.Int64Flag{
+			Name:     "expiration-ignore",
+			Value:    120,
+			Usage:    "when extending all sectors, skip sectors whose current expiration is less than <ignore> epochs from now",
+			Required: false,
+		},
+		&cli.Float64Flag{
+			Name:     "max-base-fee",
+			Value:    1.0,
+			Usage:    "only submit extend message when base fee is lower than this amount of nanoSTAR, pass this flag to save your gas",
+			Required: false,
+		},
+		&cli.Float64Flag{
+			Name:     "sectors-discount",
+			Value:    1.0,
+			Required: false,
+		},
+		&cli.StringFlag{
+			Name:     "max-fee",
+			Value:    "10",
+			Usage:    "use up to this amount of STAR for one message, pass this flag to avoid message congestion",
 			Required: false,
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-
-		api, mCloser, err := lcli.GetStorageMinerAPI(cctx)
+		nodeAPI, nCloser, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
 		}
-		nApi, nCloser, err := lcli.GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-
-		defer mCloser()
 		defer nCloser()
+
+		minerAPI, mCloser, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer mCloser()
 
 		ctx := lcli.ReqContext(cctx)
 
-		maddr, err := getActorAddress(ctx, api, cctx.String("actor"))
+		maddr, err := getActorAddress(ctx, minerAPI, cctx.String("actor"))
 		if err != nil {
 			return err
 		}
 
 		var params []miner3.ExtendSectorExpirationParams
 
-		if cctx.Bool("allsectors") {
+		if cctx.Bool("all-sectors") {
+			if !cctx.IsSet("new-expiration") {
+				return xerrors.Errorf("must pass new expiration when extend all sectors")
+			}
 
-			nv, err := nApi.StateNetworkVersion(ctx, types.EmptyTSK)
+			head, err := nodeAPI.ChainHead(ctx)
+			if err != nil {
+				return err
+			}
+
+			nv, err := nodeAPI.StateNetworkVersion(ctx, types.EmptyTSK)
 			if err != nil {
 				return err
 			}
 
 			extensions := map[miner.SectorLocation]map[abi.ChainEpoch][]uint64{}
 
-			sis, err := nApi.StateMinerActiveSectors(ctx, maddr, types.EmptyTSK)
+			// are given durations within tolerance epochs
+			withinTolerance := func(a, b abi.ChainEpoch) bool {
+				diff := a - b
+				if diff < 0 {
+					diff = b - a
+				}
+
+				return diff <= abi.ChainEpoch(cctx.Int64("tolerance"))
+			}
+
+			sis, err := nodeAPI.StateMinerActiveSectors(ctx, maddr, types.EmptyTSK)
 			if err != nil {
 				return xerrors.Errorf("getting miner sector infos: %w", err)
 			}
 
 			for _, si := range sis {
+				if si.Expiration < (head.Height() + abi.ChainEpoch(cctx.Int64("expiration-ignore"))) {
+					continue
+				}
 
 				ml := policy.GetMaxSectorExpirationExtension()
+				// if the sector's missing less than "tolerance" of its maximum possible lifetime, don't bother extending it
+				if withinTolerance(si.Expiration-si.Activation, ml) {
+					continue
+				}
 
-				newExp := ml - (miner3.WPoStProvingPeriod * 2) + si.Activation
+				newExp := abi.ChainEpoch(cctx.Int64("new-expiration"))
+				if newExp > (ml - (miner3.WPoStProvingPeriod * 2) + si.Activation) {
+					newExp = ml - (miner3.WPoStProvingPeriod * 2) + si.Activation
+				}
 
-				p, err := nApi.StateSectorPartition(ctx, maddr, si.SectorNumber, types.EmptyTSK)
+				if withinTolerance(si.Expiration, newExp) || si.Expiration >= newExp {
+					continue
+				}
+
+				p, err := nodeAPI.StateSectorPartition(ctx, maddr, si.SectorNumber, types.EmptyTSK)
 				if err != nil {
 					return xerrors.Errorf("getting sector location for sector %d: %w", si.SectorNumber, err)
 				}
@@ -676,7 +738,18 @@ var sectorsExtendCmd = &cli.Command{
 					ne[newExp] = []uint64{uint64(si.SectorNumber)}
 					extensions[*p] = ne
 				} else {
-					es[newExp] = []uint64{uint64(si.SectorNumber)}
+					added := false
+					for exp := range es {
+						if withinTolerance(exp, newExp) && newExp >= exp && exp > si.Expiration {
+							es[exp] = append(es[exp], uint64(si.SectorNumber))
+							added = true
+							break
+						}
+					}
+
+					if !added {
+						es[newExp] = []uint64{uint64(si.SectorNumber)}
+					}
 				}
 			}
 
@@ -694,7 +767,7 @@ var sectorsExtendCmd = &cli.Command{
 					if err != nil {
 						return xerrors.Errorf("failed to get declarations max")
 					}
-					if scount > addressedMax || len(p.Extensions) == declMax {
+					if scount > int(float64(addressedMax)*cctx.Float64("sectors-discount")) || len(p.Extensions) == declMax {
 						params = append(params, p)
 						p = miner3.ExtendSectorExpirationParams{}
 						scount = len(numbers)
@@ -726,7 +799,7 @@ var sectorsExtendCmd = &cli.Command{
 					return xerrors.Errorf("could not parse sector %d: %w", i, err)
 				}
 
-				p, err := nApi.StateSectorPartition(ctx, maddr, abi.SectorNumber(id), types.EmptyTSK)
+				p, err := nodeAPI.StateSectorPartition(ctx, maddr, abi.SectorNumber(id), types.EmptyTSK)
 				if err != nil {
 					return xerrors.Errorf("getting sector location for sector %d: %w", id, err)
 				}
@@ -758,10 +831,15 @@ var sectorsExtendCmd = &cli.Command{
 			return nil
 		}
 
-		mi, err := nApi.StateMinerInfo(ctx, maddr, types.EmptyTSK)
+		mi, err := nodeAPI.StateMinerInfo(ctx, maddr, types.EmptyTSK)
 		if err != nil {
 			return xerrors.Errorf("getting miner info: %w", err)
 		}
+
+		maxFee := cctx.String("max-fee")
+		spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(types.MustParseFIL(maxFee))}
+
+		maxBaseFee := abi.NewTokenAmount(int64(cctx.Float64("max-base-fee") * 1e9))
 
 		for i := range params {
 			sp, aerr := actors.SerializeParams(&params[i])
@@ -769,19 +847,46 @@ var sectorsExtendCmd = &cli.Command{
 				return xerrors.Errorf("serializing params: %w", err)
 			}
 
-			smsg, err := nApi.MpoolPushMessage(ctx, &types.Message{
+			for {
+				head, err := nodeAPI.ChainHead(ctx)
+				if err != nil {
+					return err
+				}
+
+				curBaseFee := head.Blocks()[0].ParentBaseFee
+				if curBaseFee.LessThanEqual(maxBaseFee) {
+					break
+				}
+
+				fmt.Println("current base fee", float64(curBaseFee.Int64())/1e9, "nanoSTAR is higher than", cctx.Float64("max-base-fee"), "nanoSTAR, just wait")
+				time.Sleep(30 * time.Second)
+			}
+
+			smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
 				From:   mi.Worker,
 				To:     maddr,
 				Method: miner.Methods.ExtendSectorExpiration,
 
 				Value:  big.Zero(),
 				Params: sp,
-			}, nil)
+			}, spec)
 			if err != nil {
 				return xerrors.Errorf("mpool push message: %w", err)
 			}
 
 			fmt.Println(smsg.Cid())
+
+			// wait for it to get mined into a block
+			wait, err := nodeAPI.StateWaitMsg(ctx, smsg.Cid(), build.MessageConfidence)
+			if err != nil {
+				return err
+			}
+
+			// check it executed successfully
+			if wait.Receipt.ExitCode != 0 {
+				fmt.Println("sectors extend failed!")
+				return err
+			}
 		}
 
 		return nil
