@@ -44,6 +44,7 @@ var sectorsCmd = &cli.Command{
 		sectorsStartSealCmd,
 		sectorsSealDelayCmd,
 		sectorsCapacityCollateralCmd,
+		sectorsCheckExpireCmd,
 		sectorsExtendCmd,
 	},
 }
@@ -601,6 +602,97 @@ var sectorsUpdateCmd = &cli.Command{
 		}
 
 		return nodeApi.SectorsUpdate(ctx, abi.SectorNumber(id), api.SectorState(cctx.Args().Get(1)))
+	},
+}
+
+var sectorsCheckExpireCmd = &cli.Command{
+	Name:  "check-expire",
+	Usage: "Inspect expiring sectors",
+	Flags: []cli.Flag{
+		&cli.Int64Flag{
+			Name:  "cutoff",
+			Usage: "skip sectors whose current expiration is more than <cutoff> epochs from now, defaults to 60 days",
+			Value: 172800,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+
+		fullApi, nCloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer nCloser()
+
+		minerAPI, mCloser, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer mCloser()
+
+		ctx := lcli.ReqContext(cctx)
+
+		maddr, err := getActorAddress(ctx, minerAPI, cctx.String("actor"))
+		if err != nil {
+			return err
+		}
+
+		head, err := fullApi.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+		currEpoch := head.Height()
+
+		sectors, err := fullApi.StateMinerActiveSectors(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		n := 0
+		for _, s := range sectors {
+
+			if s.Expiration-currEpoch <= abi.ChainEpoch(cctx.Int64("cutoff")) {
+				sectors[n] = s
+				n++
+			}
+		}
+		sectors = sectors[:n]
+
+		sort.Slice(sectors, func(i, j int) bool {
+			if sectors[i].Expiration == sectors[j].Expiration {
+				return sectors[i].SectorNumber < sectors[j].SectorNumber
+			}
+			return sectors[i].Expiration < sectors[j].Expiration
+		})
+
+		tw := tablewriter.New(
+			tablewriter.Col("ID"),
+			tablewriter.Col("SealProof"),
+			tablewriter.Col("InitialPledge"),
+			tablewriter.Col("Activation"),
+			tablewriter.Col("Expiration"),
+			tablewriter.Col("MaxExpiration"),
+			tablewriter.Col("MaxExtendNow"))
+
+		for _, sector := range sectors {
+			MaxExpiration := sector.Activation + policy.GetSectorMaxLifetime(sector.SealProof)
+			MaxExtendNow := currEpoch + policy.GetMaxSectorExpirationExtension()
+
+			if MaxExtendNow > MaxExpiration {
+				MaxExtendNow = MaxExpiration
+			}
+
+			tw.Write(map[string]interface{}{
+				"ID":            sector.SectorNumber,
+				"SealProof":     sector.SealProof,
+				"InitialPledge": types.FIL(sector.InitialPledge).Short(),
+				"Activation":    lcli.EpochTime(currEpoch, sector.Activation),
+				"Expiration":    lcli.EpochTime(currEpoch, sector.Expiration),
+				"MaxExpiration": lcli.EpochTime(currEpoch, MaxExpiration),
+				"MaxExtendNow":  lcli.EpochTime(currEpoch, MaxExtendNow),
+			})
+		}
+
+		return tw.Flush(os.Stdout)
 	},
 }
 

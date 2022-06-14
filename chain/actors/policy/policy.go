@@ -175,6 +175,11 @@ func GetDefaultSectorSize() abi.SectorSize {
 
 	return szs[0]
 }
+
+func GetSectorMaxLifetime(proof abi.RegisteredSealProof) abi.ChainEpoch {
+	return builtin3.SealProofPolicies[proof].SectorMaxLifetime
+}
+
 func GetAddressedSectorsMax(nwVer network.Version) (int, error) {
 	v := actors.VersionForNetwork(nwVer)
 
