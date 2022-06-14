@@ -800,7 +800,7 @@ var sectorsExtendCmd = &cli.Command{
 					continue
 				}
 
-				ml := policy.GetMaxSectorExpirationExtension()
+				ml := policy.GetSectorMaxLifetime(si.SealProof)
 				// if the sector's missing less than "tolerance" of its maximum possible lifetime, don't bother extending it
 				if withinTolerance(si.Expiration-si.Activation, ml) {
 					continue
